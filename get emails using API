@@ -1,0 +1,212 @@
+1. App registration
+
+App needs to be registered in Azure AD. For an example see setup for existing MFA Web Portal app in LTCGlobal AD. 
+Procure various parameters and secret (found below in config.cfg)
+
+
+2. Python dependencies 
+Install python3, pip and virtualenv 
+setup virtualenv 
+switch to your virtualenv 
+then:
+
+python3 -m pip install azure-identity
+python3 -m pip install msgraph-sdk
+
+Once the above has been setup, put the files below into the target directory
+
+3. Run program : 
+python3 main.py  
+
+Some explanations:
+
+- this is using Graph library to login into o365, gain access to shared mb mfadltest@ltcglobal.com then retrieve messages, 5 at a time (see top parameter in graph.py) 
+- Messages are retrieved with text body and are to be processed by some other means
+- Messages are then moved to deleted items 
+
+This is sample code but it works well on mfadltest@ltcglobal.com (shared mb). It is properly secured and should be restricted to this mb
+
+
+
+#---------------------------- File main.py -------------------------------------
+import asyncio
+import configparser
+from msgraph.generated.models.o_data_errors.o_data_error import ODataError
+from graph import Graph
+
+async def main():
+
+    # Load settings
+    config = configparser.ConfigParser()
+    config.read(['config.cfg', 'config.dev.cfg'])
+    o365_settings = config['o365']
+
+    graph: Graph = Graph(o365_settings)
+
+    try:
+        await process_inbox_messages(graph)
+
+    except ODataError as odata_error:
+        print('Error:')
+        if odata_error.error:
+            print(odata_error.error.code, odata_error.error.message)
+
+
+async def display_access_token(graph: Graph):
+    token = await graph.get_app_only_token()
+    print('App-only token:', token, '\n')
+
+async def process_inbox_messages(graph: Graph):
+    message_page = await graph.get_inbox()
+    i = 0
+    while message_page and message_page.value:
+        # if message_page and message_page.value:
+        # Output each message's details
+        for message in message_page.value:
+            i = i + 1
+            print('Message:', message.subject, i)
+
+            if (
+                message.from_ and
+                message.from_.email_address
+            ):
+                print('  From:', message.from_.email_address.name or 'NONE')
+                print('  addr:', message.from_.email_address.address)
+            else:
+                print('  From: NONE')
+            print('  Status:', 'Read' if message.is_read else 'Unread')
+            print('  Received:', message.received_date_time)
+            print('  Body:',message.body.content)
+
+            await graph.mv_message(message.id) # delete it by moving into deleted items
+
+        # If @odata.nextLink is present
+        more_available = message_page.odata_next_link is not None
+        print('\nMore messages available?', more_available, message_page.odata_next_link, '\n')
+
+        if more_available:
+            message_page = await graph.get_next(message_page.odata_next_link)
+        else:
+            message_page = None
+        # on that req we execute a get() then loop back to
+
+
+# Run main
+asyncio.run(main())
+#------------------------------------------------------------ End of Main.py ----------------------------------------
+
+#------------------------------------------------------------ Graph.py ----------------------------------------------
+
+from configparser import SectionProxy
+from azure.identity.aio import ClientSecretCredential
+from msgraph import GraphServiceClient
+from msgraph.generated.users.users_request_builder import UsersRequestBuilder
+from msgraph.generated.users.item.mail_folders.item.messages.messages_request_builder import (
+    MessagesRequestBuilder)
+from msgraph.generated.users.item.send_mail.send_mail_post_request_body import (
+    SendMailPostRequestBody)
+from msgraph.generated.models.message import Message
+from msgraph.generated.models.item_body import ItemBody
+from msgraph.generated.models.body_type import BodyType
+from msgraph.generated.models.recipient import Recipient
+from msgraph.generated.models.email_address import EmailAddress
+from msgraph.generated.users.item.mail_folders.item.messages.item.move.move_post_request_body import (
+    MovePostRequestBody)
+from pprint import pprint
+from urllib.parse import urlparse, parse_qs
+
+class Graph:
+    settings: SectionProxy
+    client_credential: ClientSecretCredential
+    app_client: GraphServiceClient
+
+    def __init__(self, config: SectionProxy):
+        self.settings = config
+        client_id = self.settings['clientId']
+        tenant_id = self.settings['tenantId']
+        client_secret = self.settings['clientSecret']
+        targetMailbox= self.settings['targetMailbox']
+
+        self.client_credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+        self.app_client = GraphServiceClient(self.client_credential) # type: ignore
+        self.sh_user = self.app_client.users.by_user_id(targetMailbox)
+
+    async def get_app_only_token(self):
+        graph_scope = 'https://graph.microsoft.com/.default'
+        access_token = await self.client_credential.get_token(graph_scope)
+        return access_token.token
+
+    async def get_inbox(self):
+        query_params = MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters(
+            # Only request specific properties
+            select=['from', 'sender','isRead', 'receivedDateTime', 'subject','body','id'],
+            # Get at most 25 results
+            top=5,
+            # Sort by received time, newest first
+            orderby=['receivedDateTime DESC']
+        )
+        request_config = MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration(
+            query_parameters= query_params,
+
+            headers = {
+               'Prefer' : "outlook.body-content-type=\"text\";IdType=\"ImmutableId\"",
+            }
+        )
+
+        messages = await self.sh_user.mail_folders.by_mail_folder_id('inbox').messages.get(
+                request_configuration=request_config)
+        return messages
+
+    async def del_message(self, id):
+        message = await self.sh_user.mail_folders.by_mail_folder_id('inbox').messages.by_message_id(id).delete()
+
+    async def mv_message(self, id):
+        request_body = MovePostRequestBody()
+        request_body.destination_id = 'deleteditems'
+        result = await self.sh_user.mail_folders.by_mail_folder_id('inbox').messages.by_message_id(id).move.post(body = request_body)
+        return result
+
+    async def get_next(self, link):
+        parsed_url = urlparse(link)
+        # Extract query parameters
+        query_parameters = parse_qs(parsed_url.query)
+        skipme = query_parameters.get('$skip', [''])[0]
+
+        query_params = MessagesRequestBuilder.MessagesRequestBuilderGetQueryParameters(
+            # Only request specific properties
+            select=['from', 'sender','isRead', 'receivedDateTime', 'subject','body','id'],
+            # Get at most 25 results
+            top=5,
+            skip = skipme,
+            # Sort by received time, newest first
+            orderby=['receivedDateTime DESC']
+        )
+
+        request_config = MessagesRequestBuilder.MessagesRequestBuilderGetRequestConfiguration(
+            query_parameters= query_params,
+
+            headers = {
+               'Prefer' : "outlook.body-content-type=\"text\";IdType=\"ImmutableId\"",
+            }
+        )
+
+        messages = await self.sh_user.mail_folders.by_mail_folder_id('inbox').messages.get(
+                request_configuration=request_config)
+        return messages
+
+#------------------------------------------------------------ End of Graph.py --------------------------------------------------
+
+#------------------------------------------------------------ File config.cfg --------------------------------------------------
+
+[o365]
+clientId = <INSERT_API_ID_HERE>
+tenantId = ###-###-###-###
+clientSecret = <INSERT_API_SECRET_HERE>
+graphUserScopes = User.Read Mail.Read Mail.Send Mail.ReadWrite
+targetMailbox = <INSERT_MB_HERE>
+
+#------------------------------------------------------------ End of config.cfg -----------------------------------------------
+
+
+
+
